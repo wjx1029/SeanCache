@@ -314,10 +314,49 @@ class KHashLrucache
 public:
     KHashLrucache(size_t capacity, int sliceNum)
         : capacity_(capacity)
-        , sliceNum_(sliceNum > 0 ? sliceNum : std::thread::hardware_concurrency())
+        , sliceNum_(sliceNum > 0 ? sliceNum : std::thread::hardware_concurrency())  //作用：返回系统支持的硬件并发线程数（即 CPU 核心数）。返回值：unsigned int（无符号整数）。
     {
-        
+        // 获取每个分片的大小
+        size_t sliceSize = std::ceil(capacity / static_cast<double>(sliceNum_));
+        //                      ^^^^  ^^^^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^
+        //                     向上取整  整数        转为 double，避免整数除法
+        for (int i = 0; i < sliceNum_; ++i)
+        {
+            lruSliceCaches_.emplace_back(new LruCache<Key, Value>(sliceSize));
+        }
     }
+
+    void put(Key key, Value value)
+    {
+        // 获取key的hash值，并计算出对应的分片索引
+        size_t sliceIndex = Hash(key) % sliceNum_;
+        lruSliceCaches_[sliceIndex]->put(key, value);
+    }
+
+    bool get(Key key, Value& value)
+    {
+        // 获取key的hash值，并计算出对应的分片索引
+        size_t sliceIndex = Hash(key) % sliceNum_;
+        lruSliceCaches_[sliceIndex]->get(key, value);
+    }
+
+    Value get(Key key)
+    {
+        Value value{};
+        memset(&value, 0, sizeof(value));
+        get(key, value);
+        return value;
+    }
+
+private:
+    // 将key转换为对应hash值
+    size_t Hash(Key key)
+    {
+        std::hash<Key> hashFunc;
+        return hashFunc(key);
+    }
+
+
 
 private:
     size_t                                              capacity_;   // 总容量
@@ -325,4 +364,4 @@ private:
     std::vector<std::unique_ptr<KLruCache<Key, value>>> lruSliceCaches_;    // 切片lru缓存
 };
 
-}
+} // namespace SeanCache
