@@ -4,6 +4,7 @@
 # include <unordered_map>
 # include <mutex>
 # include <vector>
+# include <thread>
 
 # include "KICachePolicy.h"
 
