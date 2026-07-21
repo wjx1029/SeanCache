@@ -49,7 +49,7 @@ public:
 
     bool isEmpty() const
     {
-        return head_->next == tail_
+        return head_->next == tail_;
     }
 
     void addNode(NodePtr node)
@@ -74,9 +74,15 @@ public:
         pre->next = node->next;
         node->next->prev = pre;
         node->next = nullptr;   // 确保显式置空next指针，彻底断开节点与链表的连接
+        node->prev.reset();     // 确保显式置空prev指针
     }
 
-    NodePtr getFirstNode() const {return head_->next;}
+    NodePtr getFirstNode() const 
+    {
+        if (isEmpty())
+            return nullptr;
+        return head_->next;
+    }
 
     friend class KLfuCache<Key, Value>;
 };
@@ -95,40 +101,64 @@ public:
     , minFreq_(INT8_MAX)
     , maxAverageNum_(maxAverageNum)
     , curAverageNum_(0)
-    , curTotalNUM_(0)
+    , curTotalNum_(0)
     {}
 
     ~KLfuCache() override = default;
 
     void put(Key key, Value value) override
     {
+        if (capacity_ == 0)
+            return;
 
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = nodeMap_.find(key);
+        if (it != nodeMap_.end())
+        {
+            // 重置其value值
+            it->second->value = value;
+
+            getInternal(it->second,value);
+            return;
+        }
+
+        putInternal(key, value);
     }
 
     bool get(Key key, Value& value) override
     {
-
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = nodeMap_.find(key);
+        if (it != nodeMap_.end())
+        {
+            getInternal(it->second, value);
+            return true;
+        }
+        return false;
     }
 
     Value get(Key key) override
     {
-
+        Value value{};
+        get(key, value);
+        return value;
     }
 
     // 清空缓存, 回收资源
     void purge()
     {
-
+        nodeMap_.clear();
+        freqToFreqList_.clear();
     }
 
 private:
     void putInternal(Key key, Value value);         // 添加缓存
-    void getInternal(NodePTr node, Value& value);   // 获取缓存
+    void getInternal(NodePtr node, Value& value);   // 获取缓存
 
     void kickOut();                                 // 移除缓存中的过期数据
 
     void removeFromFreqList(NodePtr node);          // 从频率列表中移除节点
-    void addtoFreqlist(NodePtr node);               // 添加到频率列表
+    void addToFreqList(NodePtr node);               // 添加到频率列表
 
     void addFreqNum();                              // 增加平均访问等频率
     void decreaseFreqNum(int num);                  // 减少平均访问等频率
@@ -138,12 +168,165 @@ private:
 private:
     int                                           capacity_;        // 缓存容量
     int                                           minFreq_;         // 最小访问频次(用于找到最小访问频次结点)
-    int                                           maxAveragenum_;   // 最大平均访问频次
+    int                                           maxAverageNum_;   // 最大平均访问频次
     int                                           curAverageNum_;   // 当前平均访问频次
-    int                                           curtotalNum_;     // 当前访问所有缓存次数总数 
+    int                                           curTotalNum_;     // 当前访问所有缓存次数总数 
     std::mutex                                    mutex_;           // 互斥锁
     NodeMap                                       nodeMap_;         // key 到 缓存节点的映射
-    std::unordered_map<int, FreqList<Key, Value>> freqToFreqList_;  // 访问频次到该频次链表的映射
+    std::unordered_map<int, FreqList<Key, Value>*> freqToFreqList_;  // 访问频次到该频次链表的映射
 };
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::putInternal(Key key, Value value)
+{
+    // 如果不在缓存中，则需要判断缓存是否已满
+    if (nodeMap_.size() == capacity_)
+    {
+        // 缓存已满，删除最不常访问的结点，更新当前平均访问频次和总访问频次
+        kickOut();
+    }
+
+    // 创建新节点, 将新节点添加进入, 更新最小访问频次
+    NodePtr node = std::make_shared<Node>(key, value);
+    nodeMap_[key] = node;
+    addToFreqList(node);
+    addFreqNum();
+    minFreq_ = std::min(minFreq_, 1);
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::getInternal(NodePtr node, Value& value)
+{
+    // 找到之后需要将其从低访问频次的链表中删除，并且添加到+1的访问频次链表中，
+    // 访问频次+1, 然后把value值返回
+    value = node->value;
+    // 从原有访问频次列表删除
+    removeFromFreqList(node);
+    node->freq++;
+    addToFreqList(node);
+    // 如果当前node的访问频次如果等于minFreq+1，并且其前驱链表为空，则说明
+    // freqToFreqList_[node->freq - 1]链表因node的迁移已经空了，需要更新最小访问频次
+    if (node->freq - 1 == minFreq_ && freqToFreqList_[node->freq - 1]->isEmpty())
+        minFreq_++;
+
+    // 总访问频次和当前平均访问频次都随之增加
+    addFreqNum();
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::kickOut()
+{
+    NodePtr node = freqToFreqList_[minFreq_]->getFirstNode();
+    removeFromFreqList(node);
+    nodeMap_.erase(node->key);
+    decreaseFreqNum(node->freq);
+    if(freqToFreqList_[minFreq_]->isEmpty())
+    {
+        updateMinFreq();
+    }
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::removeFromFreqList(NodePtr node)
+{
+    // 检查结点是否为空
+    if (!node) 
+        return;
+
+    auto freq = node->freq;
+    freqToFreqList_[freq]->removeNode(node);
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::addToFreqList(NodePtr node)
+{
+    if (!node)
+        return;
+
+    // 添加进入相应的频次链表前需要判断该频次链表是否存在
+    auto freq = node->freq;
+    if (freqToFreqList_.find(freq) == freqToFreqList_.end())
+    {
+        // 不存在则创建
+        freqToFreqList_[freq] = new FreqList<Key, Value>(freq);
+    }
+
+    freqToFreqList_[freq]->addNode(node);
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::addFreqNum()
+{
+    curTotalNum_++;
+    if (nodeMap_.empty())
+        curAverageNum_ = 0;
+    else
+        curAverageNum_ = curTotalNum_ / nodeMap_.size();
+
+    if (curAverageNum_ > maxAverageNum_)
+    {
+        handleOverMaxAverageNum();
+    }
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::decreaseFreqNum(int num)
+{
+    curTotalNum_ -= num;
+    if (nodeMap_.empty())
+        curAverageNum_ = 0;
+    else
+        curAverageNum_ = curTotalNum_ / nodeMap_.size();
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::handleOverMaxAverageNum()
+{
+    if (nodeMap_.empty())
+        return;
+
+    // 当前平均访问频次已经超过了最大平均访问频次，所有结点的访问频次- (maxAverageNum_ / 2)
+    for (auto it = nodeMap_.begin(); it != nodeMap_.end(); ++it)
+    {
+        if (!it->second)
+            continue;
+
+        NodePtr node = it->second;
+
+        // 从当前频率链表里删除
+        removeFromFreqList(node);
+
+        // 更新频率
+        int oldFreq = node->freq;
+        int decay = maxAverageNum_ / 2;
+        node->freq -= decay;
+
+        if (node->freq < 1) node->freq = 1;
+
+        int delta = node->freq - oldFreq; 
+        curTotalNum_ += delta;
+
+        // 添加到新的频率链表
+        addtoFreqList(node);
+    }
+
+    // 更新最小频率
+    updateMinFreq();
+}
+
+template<typename Key, typename Value>
+void KLfuCache<Key, Value>::updateMinFreq() 
+{
+    minFreq_ = INT8_MAX;
+    for (const auto& pair : freqToFreqList_)
+    {
+        if (pair.second && !pair.second->isEmpty()) 
+        {
+            minFreq_ = std::min(minFreq_, pair.first);
+        }
+    }
+    if (minFreq_ == INT8_MAX)
+        minFreq_ = 1;
+}
 
 } // namespace
